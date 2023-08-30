@@ -68,7 +68,7 @@ and emitting another event that triggers the execution.
 In addition to making it easy to understand and independently reason about individual components,
 such an execution model is particularly well suited for being expressed in the Mir framework \cite{mir} which we use to implement Trantor.
 
-% Marko: Here there is a gap which needs to be massaged, I do not think batching is that relevant to be highlighted here. 
+% Marko: Here there is a gap which needs to be massaged, I do not think batching is that relevant to be highlighted here.
 
 Trantor delivers a continuous stream of transaction batches to the application on each replica,
 but its usage of memory and storage does not grow indefinitely.
@@ -279,6 +279,7 @@ It mainly consumes \event{OrderedBatch} events and applies the contained transac
 The execution component is also involved in checkpointing and configuring the set of replicas, which we discuss in \cref{sec:algorithm-details}.
 
 \subsection{Epoch-Based Operation and Configuration}
+\label{sec:epochs-and-configuration}
 
 We express the progress of the whole system through the length of the transaction log.
 Each ordered batch has a position in the transaction log that we call height.
@@ -318,6 +319,7 @@ The corresponding transaction log is depicted in \cref{fig:transaction-log}.
 
 A replica actively participates in the distributed protocols pertaining to only one epoch at a time.
 Only once it fills the whole epoch’s transaction log does it advance to the next epoch.
+While in principle it is possible to run multiple epochs concurrently, we stick to one epoch at a time for simplicity.
 
 \begin{figure}[h]
     \centering
@@ -343,10 +345,10 @@ of the first epoch the configuration of which they are part of.
 
 To better streamline Trantor’s operation,
 a configuration provided by the application at the end of epoch $e$ is not used directly in epoch $e+1$,
-but rather in epoch $e+1+\textit{configOffset}$, where \textit{configOffset} is a system parameter.
+but rather in epoch $e+1+\param{configOffset}$, where \param{configOffset} is a system parameter.
 A checkpoint thus contains the configuration for not just the epoch it starts,
-but also for \textit{configOffset} additional subsequent epochs.
-Correspondingly, Trantor uses the initial configuration for the first $\textit{configOffset}+1$ epochs.
+but also for \param{configOffset} additional subsequent epochs.
+Correspondingly, Trantor uses the initial configuration for the first $\param{configOffset}+1$ epochs.
 
 \section{Algorithm Details}
 \label{sec:algorithm-details}
@@ -423,8 +425,8 @@ parametrized with a snapshot of the system state comprised of:
 \item The current state of the application as obtained from the execution component
 \item Relevant state of the Trantor protocol itself,
 such as epoch number, height, and other variables that need to be reinitialized when restoring the state
-\item Configuration of epoch $e$ and the \textit{configOffset} following epochs
-\item Information about processed transactions (needed for deduplication, see Section \cref{sec:tx-deduplication})
+\item Configuration of epoch $e$ and the \param{configOffset} following epochs
+\item Information about processed transactions (needed for deduplication, see \cref{sec:tx-deduplication})
 \end{compactitem}
 Each replica of epoch $e-1$ then executes a simple checkpointing protocol akin to the one used in PBFT:
 \begin{enumerate}
@@ -462,6 +464,7 @@ to agree on one single version of the certificate.
 This certificate is then used by all replicas for the checkpoint delivered to the application.
 
 \subsection{Garbage Collection and State Transfer}
+\label{sec:garbate-collection-state-transfer}
 
 A checkpoint for epoch $e$ (i.e, appearing between epochs $e-1$ and $e$ in the transaction log)
 contains all information necessary for a replica to start / continue operating from the beginning of epoch $e$.
@@ -511,7 +514,7 @@ The data structures required by such a simple filter, however, would grow indefi
 We therefore introduce the concept of a client watermark window - a range of \textit{TxNo}s a client is allowed to concurrently submit to the system.
 If a transaction outside of the client’s watermark window appears in the mempool, Trantor is allowed to ignore it.
 At each epoch transition, Trantor sets the start of each known client’s watermark window to the lowest \textit{TxNo} not yet executed.
-The window then extends over the next \textit{windowSize} transaction numbers, where \textit{windowSize} is a system parameter.
+The window then extends over the next \param{WindowSize} transaction numbers, where \param{WindowSize} is a system parameter.
 
 Leveraging the client watermark window, Trantor only needs a constant amount of memory to represent
 all transactions ever executed that originate from a single client.
@@ -564,7 +567,7 @@ Applications that wish to be able to dynamically reconfigure the Trantor system 
 On top of the simple one, the full-fledged application interface contains one additional function:
 \begin{itemize}
     \item \code{NewEpoch(number) \textrightarrow{} configuration}: Announces the start of a new trantor epoch with number number.
-    Returns a configuration to be used by Trantor after \textit{configOffset} epochs.
+    Returns a configuration to be used by Trantor after \param{configOffset} epochs.
 \end{itemize}
 
 We expect the decisions on new configurations to be made by the replicated application logic, based only on the replicated state.
@@ -649,6 +652,68 @@ The standard sequence of invocations from the start of an epoch then follows (un
 13. ...
 \end{lstlisting}
 
+\section{Implementation}
+\label{sec:implementation}
+
+\begin{figure}
+    \centering
+    \includegraphics[width=\textwidth]{figures/implementation-diagram}
+    \caption{Schematic view of Trantor's implementation's components.
+    A line between two boxes means that the two components interact.
+    The four bottom-most components (\module{Networkig}, \module{Timer}, \module{Hashing}, and \module{Crypto}) have a supporting role.
+    They interact with many other components and we omit the corresponding lines in the diagram for simplicity of presentation.}
+    \label{fig:implementation-diagram}
+\end{figure}
+
+We now present our implementation of Trantor, diving deeper into Trantor's architecture and refining the descriptions from \cref{sec:overview,sec:algorithm-details}.
+We implement Trantor in Go, using the Mir distributed system implementation framework \cite{mir}.
+\Cref{fig:implementation-diagram} displays all relevant modules of Trantor's implementation and their interactions.
+It rather accurately represents the structure of our code, omitting only few technical details not relevant for understanding the workings of the implementation.
+Note that we are describing the implementation of a \emph{single replica}.
+Each replica runs its own copy of what we present in this section.
+In the following, we first explain some overarching concepts relevant for all modules and then describe each module in detail.
+
+\subsection{Epochs}
+
+As mentioned in \cref{sec:epochs-and-configuration}, Trantor's operation is epoch-based.
+Therefore, several components are, explicitly or implicitly, associated with a concrete epoch.
+The \module{Orchestrator} module drives progress from one epoch into the next one.
+It instantiates and initializes all the modules necessary for an epoch, assembles the corresponding part of the event log from their output,
+triggers the creation of a checkpoint, and, when the checkpoint is available, triggers garbage collection.
+
+Several modules in \cref{fig:implementation-diagram} (\module{Dissemination}, \module{Ordering}, \module{Checkpointing}) contain submodules.
+While the top-level modules are long-lived and exist throughout Trantor's operation,
+the submodules are generally only relevant for one epoch, for which the \module{Orchestrator} dynamically instantiates them, and are eventually garbage-collected.
+
+\subsection{Garbage Collection Using the Retention Index}
+
+In Trantor, garbage collection is very explicit.
+Each data structure (including whole submodules) that is subject to garbage collection is explicitly associated with an integer \emph{retention index}.
+The retention index is a system-wide, monotonically increasing variable driven by the \module{Orchestrator}.
+All data associated with a retention index lower than the current one is defined to be obsolete and safe to delete.
+In Trantor, the retention index is derived from the epoch number,
+resulting in the garbage collection semantics described in \cref{sec:garbate-collection-state-transfer}.
+
+We could have performed garbage collection directly based on the epoch number,
+but using the retention index helps keep the semantically different concepts ``progress in SMR'' and ``garbage collection'' cleanly separated.
+This way, modules that otherwise do not have a reason to be aware of the progress of the whole state machine (or even of the concept of SMR)
+-- which are, in fact, most of the modules --
+can be cleaner, simpler, more general, and thus more reusable.
+
+\subsection{Trantor's Modules}
+
+\subsubsection{\module{Orchestrator}}
+
+The \module{Orchestrator} is the heart (and brain) of Trantor.
+Its main task is to advance the transaction log.
+In addition to the transaction log data structure, the \module{Orchestrator} maintains the configuration
+(including replica membership information) for the current and \param{ConfigOffset} next epochs,
+as well as the most recent checkpoint.
+It keeps track of the progress of other replicas in order to decide when they need to be sent a checkpoint to catch up.
+
+Trantor always starts operating from an initial checkpoint (equivalent to a genesis block in some other blockchain systems),
+with which the \module{Orchestrator} is initialized
+
 \section{Performance Evaluation}
 \label{sec:evaluation}
 
@@ -692,18 +757,18 @@ The mempool's operation is influenced by several parameters:
 
 \begin{itemize}
     
-    \item \textit{MaxTransactionsInBatch}: An emitted \event{NewBatch} event never contains more than \textit{MaxTransactionsInBatch} transactions.
-    If the number of stored transactions exceeds this value, the next emitted batch will contain the \textit{MaxTransactionsInBatch} least recently added transactions.
+    \item \param{MaxTransactionsInBatch}: An emitted \event{NewBatch} event never contains more than \param{MaxTransactionsInBatch} transactions.
+    If the number of stored transactions exceeds this value, the next emitted batch will contain the \param{MaxTransactionsInBatch} least recently added transactions.
     In our experiments, we always use a value 2048 for this parameter (chosen empirically after exploring a few others).
     
-    \item \textit{MaxPayloadInBatch}: Analogously to \textit{MaxTransactionsInBatch},
-    \textit{MaxPayloadInBatch} defines the maximal total cumulative payload size of all transactions in a batch.
+    \item \param{MaxPayloadInBatch}: Analogously to \param{MaxTransactionsInBatch},
+    \param{MaxPayloadInBatch} defines the maximal total cumulative payload size of all transactions in a batch.
     We use a very large value of 16MB in our experiments to effectively disable this limit.
     
-    \item \textit{BatchTimeout}: To enable effective batching of transactions, the mempool does not respond to a \event{BatchRequest} immediately
+    \item \param{BatchTimeout}: To enable effective batching of transactions, the mempool does not respond to a \event{BatchRequest} immediately
     if there are not enough pending transactions for reaching at least one of the two above limits.
-    \textit{BatchTimeout} defines the maximal time the mempool waits for a batch to fill.
-    After \textit{BatchTimeout} elapses, the mempool emits a \event{NewBatch}, even if it is not full (or is even completely empty).
+    \param{BatchTimeout} defines the maximal time the mempool waits for a batch to fill.
+    After \param{BatchTimeout} elapses, the mempool emits a \event{NewBatch}, even if it is not full (or is even completely empty).
 \end{itemize}
 
 \subsection{Load Generation Generation and Data Collection}
@@ -761,7 +826,7 @@ and under a load of up to 8'000 concurrent clients (throughput of 4000' tx/s), T
 Trantor keeps a latency under 1.3 seconds until it reaches its peak throughput of above 30'000 tx/s with around 50'000 concurrent clients.
 At this point, the system saturates and an increased number of clients only results in an increased latency.
 When increasing the number of clients even further, even the throughput starts decreasing due to thrashing effects.
-We chose the \textit{BatchTimeout} of 0.4 seconds empirically,
+We chose the \param{BatchTimeout} of 0.4 seconds empirically,
 as it provided the best results after a brief (and non-exhaustive) search of the parameter space.
 
 A WAN deployment of 64 replicas yields slightly higher latency and, interestingly, a comparable peak throughput.
@@ -769,8 +834,8 @@ This suggests that the network bandwidth is not the bottleneck, at least for the
 Indeed, The average bandwidth used per replica at saturation is 16 MiB/s and 21 MiB/s respectively for the small and large scale deployment.
 
 Another interesting phenomenon occurs at throughputs between 10'000 and ca. 17'000 tx/s, where both system sizes exhibit the same latencies.
-We attribute this to the different setting of the \textit{BatchTimeout} parameter for the two different system sizes,
-as we increase the \textit{BatchTimeout} at larger scale to 0.8 s to compensate for the higher message processing overhead.%
+We attribute this to the different setting of the \param{BatchTimeout} parameter for the two different system sizes,
+as we increase the \param{BatchTimeout} at larger scale to 0.8 s to compensate for the higher message processing overhead.%
 \footnote{Due to the rather large batch size limit of 2048 transactions,
 most of the batches in our experiments are not completely full and are triggered by the \event{BatchTimeout}, especially before the system is saturated.}
 
@@ -779,17 +844,17 @@ most of the batches in our experiments are not completely full and are triggered
     \includegraphics[width=0.79\textwidth]{figures/results-lan-final.png}
     \caption{\centering Median latency (in seconds) vs. throughput (in tx/s)
     in a LAN deployment of 32 and 64 replicas,
-    for various segment lengths and \textit{BatchTimeout} values.}
+    for various segment lengths and \param{BatchTimeout} values.}
     \label{fig:eval-lan}
 \end{figure}
 
-% \paragraph{\textit{SegmentLength} parameter.} Being heavily inspired by ISS \cite{iss},
+% \paragraph{\param{SegmentLength} parameter.} Being heavily inspired by ISS \cite{iss},
 % Trantor's ordering protocol subdivides each epoch into so-called segments.
 % In a nutshell, a segment is a subset of sequence numbers within one epoch for which the same replica is disseminating and proposing a transaction batch
 % (i.e., in our case, serves as the PBFT primary).
 % The union of all segments makes up the whole epoch.
-% The \textit{SegmentLength} is the number of batches each replica needs to propose (and have the system agree upon) in each epoch.
-% Thus, for example, for a \textit{SegmentLength} of 2 and 32 replicas, the epoch length is 64
+% The \param{SegmentLength} is the number of batches each replica needs to propose (and have the system agree upon) in each epoch.
+% Thus, for example, for a \param{SegmentLength} of 2 and 32 replicas, the epoch length is 64
 % and each replica proposes (concurrently with other replicas) 2 batches before the next epoch can start.
 
 % Since Trantor creates a checkpoint at each epoch transition,
@@ -800,7 +865,7 @@ most of the batches in our experiments are not completely full and are triggered
 % If a single replica is slow at, say, disseminating transaction batches,
 % all other replicas need to wait for it at the end of the epoch,
 % which has a significant impact on the latency of transactions waiting in the mempool.
-% For all experiments except for one, we use a \textit{SegmentLength} of 2.
+% For all experiments except for one, we use a \param{SegmentLength} of 2.
 
 \Cref{fig:eval-lan} shows Trantor's performance when deployed in a single datacenter with a fast network.
 For 32 replicas, until the system starts becoming saturated at 60'000 tx/s, Trantor's latency is mostly under 0.25 seconds.
@@ -808,7 +873,7 @@ For a deployment of 64 replicas, throughput drops to 40'000 tx/s and latency inc
 This is because each replica needs to wait for a larger quorum in order to make progress in both the dissemination and the ordering protocol.
 Also, the overhead of ordering every transaction is higher, as each replica needs to send more outgoing messages and process more incoming ones.
 This has a strong impact both on the network bandwidth (mostly for the dissemination component) and CPU load (mostly the ordering component).
-We partially compensate for the higher CPU load by increasing the \textit{BatchTimeout} to 0.8 seconds,
+We partially compensate for the higher CPU load by increasing the \param{BatchTimeout} to 0.8 seconds,
 but it does not seem to be sufficient on a LAN.
 We attribute this to a bandwidth bottleneck since, at saturation, both the small and large scale deployments
 rarely exceed an average network transmission rate of 35 MiB/s per replica.
