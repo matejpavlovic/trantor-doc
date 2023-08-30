@@ -12,16 +12,17 @@
 \maketitle
 
 \begin{abstract}
-Trantor is a modular state machine replication (SMR) system.
-It decomposes the concept of SMR into multiple smaller components and draws meaningful abstractions around them.
+
+We present Trantor, a modular state machine replication (SMR) system.
+It decomposes the concept of SMR into multiple smaller components and draws carefully designed, simple yet powerful abstractions around them.
 Trantor aims at being practical, not neglecting important technical aspects
-such as checkpointing, state transfer, garbage collection, reconfiguration, or weighted voting making them an integral part of the design.
-Trantor's modularity allows it to be flexible, maintainable, adaptable, and future-proof.
+such as checkpointing, state transfer, garbage collection, reconfiguration, or weighted voting, making them an integral part of the design.
+Trantor's modularity allows it to be flexible, maintainable, adaptable, and future-proof, which are our main design goals.
 Components such as the total-order broadcast protocol can easily be swapped in and out, potentially even at runtime.
 
-Our Byzantine fault-tolerant implementation and preliminary performance evaluation of Trantor
-shows a throughput over 30k tx/s with a latency of 2.2 seconds (and 0.5 seconds at 5'000 tx/s)
-at a moderate scale of 64 replicas dispersed over 5 different continents,
+Even though the focus of Trantor is not on performance, a preliminary performance evaluation of our Byzantine fault-tolerant implementation
+shows an attractive  throughput of over 30k tx/s with a latency of under 1.3 seconds (and 0.5 seconds at 5'000 tx/s)
+at a moderate scale of 32 replicas dispersed over 5 different continents,
 despite a naive implementation of many of Trantor's components.
 
 \end{abstract}
@@ -40,29 +41,42 @@ Starting from some initial state, its state is deterministically updated by appl
 Thus, the state of the application is completely determined by the initial state and an ordered sequence of transactions known as the transaction log.
 It is the SMR system’s task to maintain an identical copy of the ever-growing transaction log on each non-faulty replica
 and apply it to the application, despite the faults of some replicas.
-
-Trantor is a state machine replication system.
-It runs across multiple replicas in a network, each initialized with an application and its initial state.
-Trantor receives transactions, submitted by clients, on its input, orders them,
+An SMR system runs across multiple replicas in a network, each initialized with an application and its initial state.
+It  receives transactions, submitted by clients, on its input, orders them,
 and ensures that each replica's copy of the application executes all the transactions in the given order.
 
-As most SMR systems, Trantor employs batching to increase throughput:
-It creates batches (also called blocks) of transactions at its input
-and executes its ordering algorithm on those batches rather than on individual transactions.
+Many blockchain systems share this SMR architecture, such as Ethereum \cite{ethereum}, Filecoin \cite{filecoin}, The Internet Computer \cite{dfinity}, Aptos \cite{aptos}, and many others.
+These systems are usually designed around a single consensus (transaction ordering) protocol that is built in the node software and tightly coupled with other components.
+The monolithic design often integrates many concepts from transaction dissemination, through ordering, all the way to execution.
+Swapping the execution engine for another one or completely changing the consensus protocol,
+with minimal changes to the rest of the system, would probably imply significant design and implementation overhead.
+
+This paper presents Trantor, a novel SMR system.
+The main design goal of Trantor is high modularity, not just in its implementation, but at a conceptual level.
+The reason we focus on modularity is to enable tailoring an SMR system to different deployment scales,
+allowing for different sub-protocol implementations and catering for different application and performance needs.
+These goals are especially important in multi-instance SMR / blockchain deployment architectures aiming at scaling bockchain systems, such as Interplanetary Consensus (IPC) \cite{ipc}.
+
+Trantor builds on the idea of separating the dissemination of transaction payloads from ordering
+(also used in other systems \cite{modularblockchain,narwhal,bullshark}),
+and takes this concept even further.
+It consists of multiple loosely coupled components with well-defined event-based interfaces, as is common when defining distributed abstractions.
+Different stages of Trantor’s operation are separate components that interact through events.
+E.g., when a new transaction batch (also called a block) is appended to the transaction log by the ordering component,
+it triggers an event to which the fetching component reacts by fetching the corresponding transaction data
+and emitting another event that triggers the execution.
+In addition to making it easy to understand and independently reason about individual components,
+such an execution model is particularly well suited for being expressed in the Mir framework \cite{mir} which we use to implement Trantor.
+
+% Marko: Here there is a gap which needs to be massaged, I do not think batching is that relevant to be highlighted here. 
+
 Trantor delivers a continuous stream of transaction batches to the application on each replica,
 but its usage of memory and storage does not grow indefinitely.
 It is up to the application to process this (infinite) stream of transaction batches in a way that does not exhaust its resources.
-
 To this end, Trantor periodically asks the application to create a snapshot of its state after the application of a specific prefix of the transaction log.
 The application is expected to be able to completely restore its state from such a snapshot.
 Trantor includes these snapshots (along with other metadata) in checkpoints.
 After creating such a checkpoint, Trantor deletes all data pertaining to the checkpointed prefix of the transaction log.
-
-The set of replicas Trantor runs on can dynamically change.
-Those changes are driven by the application itself, by passing the replica configuration information
-(consisting of identities and network addresses of the replicas) to Trantor at run time.
-The initial replica set is Trantor’s configuration parameter.
-Trantor then periodically requests the next configuration from the application and parametrizes its components accordingly.
 
 \begin{wrapfigure}{r}{0.5\textwidth}
     \includegraphics[width=\linewidth]{figures/application-interface.jpeg}
@@ -70,21 +84,15 @@ Trantor then periodically requests the next configuration from the application a
     \label{fig:application-interface}
 \end{wrapfigure}
 
+The set of replicas Trantor runs on can dynamically change.
+Those changes are driven by the application itself, by passing the replica configuration information
+(consisting of identities and network addresses of the replicas) to Trantor at run time.
+The initial replica set is Trantor’s configuration parameter.
+Trantor then periodically requests the next configuration from the application and parametrizes its components accordingly.
+
 The basic interaction between Trantor and the application is similar in spirit to CometBFT’s ABCI++ interface \cite{abciplusplus}
 and is depicted in \cref{fig:application-interface}.
 We describe it in detail in \cref{sec:execution}.
-
-Trantor is highly modular, not just in its implementation, but at a conceptual level.
-It builds on the idea of separating the dissemination of transaction payloads from the ordering (also used in other systems \cite{modularblockchain,narwhal,bullshark}),
-and takes this concept even further.
-
-Trantor consists of multiple loosely coupled components with well-defined event-based interfaces, as is common when defining distributed abstractions.
-Different stages of Trantor’s operation, as well as checkpointing, are separate components that interact through events.
-E.g., when a new batch is appended to the transaction log by the ordering component,
-it triggers an event to which the fetching component reacts by fetching the corresponding transaction data
-and emitting another event that triggers the execution.
-In addition to making it easy to understand and independently reason about individual components,
-such an execution model is particularly well suited for being expressed in the Mir framework \cite{mir} which we use to implement Trantor.
 
 In the rest of this document,
 we briefly discuss related work in \cref{sec:related-work} and define the system model in \cref{sec:system-model}.
@@ -95,15 +103,6 @@ Finally, we conclude in \cref{sec:conclusions}.
 
 \section{Related Work}
 \label{sec:related-work}
-
-Being a state machine replication system,
-Trantor’s goal is to allow an arbitrary application modeled as a deterministic state machine
-to be deployed across multiple replicas in a fault-tolerant way.
-Many blockchain systems share this goal, such as Ethereum \cite{ethereum} Filecoin \cite{filecoin}, The Internet Computer \cite{dfinity}, Aptos \cite{aptos}, and many others.
-These systems are usually designed around a single consensus protocol that is built in the node software and tightly coupled with other components.
-The monolithic design often integrates many concepts from transaction dissemination, through ordering, all the way to execution.
-Swapping the execution engine for another one or completely changing the consensus protocol,
-with minimal changes to the rest of the system, would probably imply significant design and implementation overhead.
 
 Trantor proposes a decomposition of an SMR system at the conceptual level,
 and follows this decomposition in its system design.
@@ -425,7 +424,7 @@ parametrized with a snapshot of the system state comprised of:
 \item Relevant state of the Trantor protocol itself,
 such as epoch number, height, and other variables that need to be reinitialized when restoring the state
 \item Configuration of epoch $e$ and the \textit{configOffset} following epochs
-\item Information about processed transactions (needed for deduplication, see Section ??)
+\item Information about processed transactions (needed for deduplication, see Section \cref{sec:tx-deduplication})
 \end{compactitem}
 Each replica of epoch $e-1$ then executes a simple checkpointing protocol akin to the one used in PBFT:
 \begin{enumerate}
