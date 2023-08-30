@@ -655,20 +655,8 @@ The standard sequence of invocations from the start of an epoch then follows (un
 \section{Implementation}
 \label{sec:implementation}
 
-\begin{figure}
-    \centering
-    \includegraphics[width=\textwidth]{figures/implementation-diagram}
-    \caption{Schematic view of Trantor's implementation's components.
-    A line between two boxes means that the two components interact.
-    The four bottom-most components (\module{Networkig}, \module{Timer}, \module{Hashing}, and \module{Crypto}) have a supporting role.
-    They interact with many other components and we omit the corresponding lines in the diagram for simplicity of presentation.}
-    \label{fig:implementation-diagram}
-\end{figure}
-
 We now present our implementation of Trantor, diving deeper into Trantor's architecture and refining the descriptions from \cref{sec:overview,sec:algorithm-details}.
 We implement Trantor in Go, using the Mir distributed system implementation framework \cite{mir}.
-\Cref{fig:implementation-diagram} displays all relevant modules of Trantor's implementation and their interactions.
-It rather accurately represents the structure of our code, omitting only few technical details not relevant for understanding the workings of the implementation.
 Note that we are describing the implementation of a \emph{single replica}.
 Each replica runs its own copy of what we present in this section.
 In the following, we first explain some overarching concepts relevant for all modules and then describe each module in detail.
@@ -700,19 +688,48 @@ This way, modules that otherwise do not have a reason to be aware of the progres
 -- which are, in fact, most of the modules --
 can be cleaner, simpler, more general, and thus more reusable.
 
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=\textwidth]{figures/implementation-diagram}
+    \caption{Schematic view of Trantor's implementation's components.
+    A line between two boxes means that the two components interact.
+    The four bottom-most components (\module{Networkig}, \module{Timer}, \module{Hashing}, and \module{Crypto}) have a supporting role.
+    They interact with many other components and we omit the corresponding lines in the diagram for simplicity of presentation.}
+    \label{fig:implementation-diagram}
+\end{figure}
+
 \subsection{Trantor's Modules}
+
+\Cref{fig:implementation-diagram} displays all relevant modules of Trantor's implementation and their interactions.
+It rather accurately represents the structure of our code, omitting only few technical details not relevant for understanding the workings of the implementation.
+To improve the presentation, the names of some events and modules also do not necessarily fully correspond to those used in the code.
 
 \subsubsection{\module{Orchestrator}}
 
 The \module{Orchestrator} is the heart (and brain) of Trantor.
 Its main task is to advance the transaction log.
-In addition to the transaction log data structure, the \module{Orchestrator} maintains the configuration
-(including replica membership information) for the current and \param{ConfigOffset} next epochs,
+In addition to the transaction log data structure, the \module{Orchestrator} maintains the configurations
+(including replica membership information) of the current and \param{ConfigOffset} next epochs,
 as well as the most recent checkpoint.
-It keeps track of the progress of other replicas in order to decide when they need to be sent a checkpoint to catch up.
+It also keeps track of the progress of other replicas in order to decide when they need to be sent a checkpoint to catch up.
 
 Trantor always starts operating from an initial checkpoint (equivalent to a genesis block in some other blockchain systems),
-with which the \module{Orchestrator} is initialized
+with which the \module{Orchestrator} is initialized.
+A checkpoint, by definition, defines the system state at the start of an epoch.
+Upon initialization, the \module{Orchestrator} thus initializes all its internal data structures
+and emits events other modules corresponding to the start of a new epoch.
+This includes instructing the \module{Dissemination} and \module{Ordering} modules to create new submodules
+executing, respectively, the dissemination and ordering protocols for the new epoch.
+The \module{Orchestrator} then waits for events from the \module{Ordering} module announcing the delivery of availability certificates
+for all the heights of the epoch, which it relays (in the correct order) to the \module{Block Fetcher}.
+
+At any point in time, the \module{Orchestrator} may receive a \event{RestoreFromCheckpoint} event,
+in which case it performs a re-initialization as described above, using the received checkpoint.
+
+The \module{Orchestrator} consumes the following events:
+\begin{itemize}
+    \item 
+\end{itemize}
 
 \section{Performance Evaluation}
 \label{sec:evaluation}
