@@ -332,6 +332,7 @@ While in principle it is possible to run multiple epochs concurrently, we stick 
 \end{figure}
 
 \subsubsection{Configuration}
+\label{sec:configuration}
 
 The configuration of the whole system (including the set of replicas) is fixed throughout an epoch,
 but can change from one epoch to another.
@@ -416,6 +417,7 @@ Trantor advances to the next epoch, repeating the whole process.
 For details on the ordering protocol, we refer the interested reader to ISS \cite{iss}.
 
 \subsection{Creating Checkpoints}
+\label{sec:creating-checkpoints}
 
 The creation of checkpoints is performed by a dedicated sub-protocol, but is orchestrated by the ordering component.
 Immediately after a transition from epoch $e-1$ to $e$, before any batches are appended to the transaction log,
@@ -704,6 +706,10 @@ can be cleaner, simpler, more general, and thus more reusable.
 It rather accurately represents the structure of our code, omitting only few technical details not relevant for understanding the workings of the implementation.
 To improve the presentation, the names of some events and modules also do not necessarily fully correspond to those used in the code.
 
+For simplicity, this description also does not distinguish between modules handling local events (received from other modules)
+and network messages (from other replicas), even though they are handled slightly differently in practice,
+since, unlike local events, network messages must always be assumed to be potentially created by a malicious adversary.
+
 \subsubsection{\module{Orchestrator}}
 
 The \module{Orchestrator} is the heart (and brain) of Trantor.
@@ -716,19 +722,154 @@ It also keeps track of the progress of other replicas in order to decide when th
 Trantor always starts operating from an initial checkpoint (equivalent to a genesis block in some other blockchain systems),
 with which the \module{Orchestrator} is initialized.
 A checkpoint, by definition, defines the system state at the start of an epoch.
-Upon initialization, the \module{Orchestrator} thus initializes all its internal data structures
-and emits events other modules corresponding to the start of a new epoch.
+The \module{Orchestrator} thus initializes all its internal data structures
+and emits events to other modules corresponding to the start of a new epoch.
 This includes instructing the \module{Dissemination} and \module{Ordering} modules to create new submodules
 executing, respectively, the dissemination and ordering protocols for the new epoch.
 The \module{Orchestrator} then waits for events from the \module{Ordering} module announcing the delivery of availability certificates
 for all the heights of the epoch, which it relays (in the correct order) to the \module{Block Fetcher}.
+Each delivered availability certificate is explicitly annotated with its position in the transaction log
+and the \module{Orchestrator} does not expect the certificates to be delivered in order.
 
 At any point in time, the \module{Orchestrator} may receive a \event{RestoreFromCheckpoint} event,
 in which case it performs a re-initialization as described above, using the received checkpoint.
 
 The \module{Orchestrator} consumes the following events:
 \begin{itemize}
-    \item 
+
+    \item \event{DeliverCert(height, cert)}\\
+    This event means that one of the \module{Consensus/TOB} modules delivered an availability certificate
+    for some particular height.
+    The \module{Orchestrator} inserts the delivered availability certificate
+    at the corresponding height in the transaction log.
+    The \module{Orchestrator} then announces as many availability certificates from the transaction log as possible
+    to the \module{Block Fetcher}, while respecting in-order delivery
+    (i.e., announcing the availability certificates according to their heights).
+
+    \item \event{NewCheckpoint(checkpoint)}\\
+    This event means that the \module{Checkpoint} module produced a checkpoint.
+    In turn, the \module{Orchestrator} initiates agreement on this new checkpoint (see \cref{sec:creating-checkpoints}).
+    To this end, it creates a new instance of a \module{Consensus/TOB} module -- more precisely,
+    makes the \module{Ordering} module do so -- by emitting a \event{NewModule} event to \module{Ordering},
+    with the new checkpoint set as the proposal.
+
+    \item \event{DeliverCheckpoint(checkpoint)}\\
+    This event means that the \module{Consensus/TOB} module agreeing on the checkpoint reached a decision.
+    The \module{Orchestrator} updates its most recent checkpoint
+    and announces the agreed-upon checkpoint to the \module{Block Fetcher}.
+
+    Moreover, the \module{Orchestrator} performs garbage collection of both its internal state
+    and several other modules (such as \module{Dissemination}, \module{Ordering}, and others)
+    by triggering their corresponding \event{GarbageCollect} events with a retention index
+    that corresponds to the epoch of the delivered checkpoint.
+
+    \item \event{EpochProgress(replica, epoch)}\\
+    This event notifies the \module{Orchestrator} about a replica having advanced to a particular epoch.
+    The \module{Orchestrator} updates its local view about that replicas progress
+    (the maximal epoch it has been seen advancing to).
+    The \module{Orchestrator} uses this information when deciding which other replicas need to be sent a checkpoint
+    to restore their state from.
+    This event is triggered by the \module{Checkpoint} module whenever it receives a message from a replica.
+    While other modules could also trigger this event on the reception of an epoch-annotated message,
+    we chose the \module{Checkpoint} module, as it only receives one message per epoch per replica.
+
+    \item \event{RestoreFromCheckpoint(checkpoint)}\\
+    When another replica considers this replica to have fallen behind (by the mechanism explained just above),
+    the \module{Orchestrator} will receive the \event{RestoreFromCheckpoint} event
+    (triggered by a message from the other replica).
+    If the received checkpoint is indeed more recent than the locally stored latest checkpoint,
+    the \module{Orchestrator} initiates validation of the received checkpoint
+    by triggering a \event{ValidateCheckpoint} at the \module{Checkpoint Validator}.
+
+    \item \event{CheckpointValidated}\\
+    When the \module{Checkpoint Validator} successfully validated a received checkpoint,
+    the \module{Orchestrator} re-initializes the whole system from it, as described above.
+
+    \item \event{PushCheckpointTimeout}\\
+    The \module{Orchestrator} periodically receives this event from the \module{Timer} module.
+    Each time, it checks the observed progress of other replicas and,
+    if an of them is locally perceived as having fallen behind,
+    sends sends them the latest checkpoint to restore their state from.
+
+    \item \event{NewConfig}\\
+    As described in \cref{sec:configuration}, the \module{Application} module defines the system configurations.
+    Those have the form of a \event{NewConfig} event received by the \module{Orchestrator},
+    which stores the configuration until until the epoch in which it needs to be applied.
+
+\end{itemize}
+
+\subsubsection{\module{Ordering}}
+
+The \module{Ordering} module is responsible for managing \module{Consensus/TOB} submodules.
+In each epoch, it contains one or more submodules that agree on the assignment of availability certificates
+to different heights in the transaction log.
+Moreover, in each epoch, \module{Ordering} contains one more submodule to agree on the epoch checkpoint.
+The \module{Ordering} module creates and destroys the submodules as commanded by the \module{Orchestrator}.
+
+The \module{Ordering} module consumes the following events:
+
+\begin{itemize}
+
+    \item \event{NewModule(moduleConfig, retentionIndex)}\\
+    Upon receiving this event, the \module{Ordering} module instantiates a new \module{Consensus/TOB} submodule
+    (that implements the PBFT protocol in our case).
+    The created submodule is associated with the given retention index and parametrized according to \event{moduleConfig}.
+    Parameters include the membership, the heights for which the submodule needs to reach agreement,
+    an optional proposal for each height, and some protocol-specific parameters.%
+    \footnote{Even the protocol itself could be chosen by a parameter, even though our implementation only supports PBFT so far.}
+
+    \item \event{GarbageCollect(retentionIndex)}\\
+    Upon reception of this event (from the \module{Orchestrator}),
+    the \module{Ordering} module deletes all its submodules that have been created with a lower retention index than the given one.
+
+\end{itemize}
+
+\subsection{\module{Consensus/TOB}}
+
+The \module{Consensus/TOB} modules are dynamically created and deleted by the \module{Ordering} module
+and are responsible for executing the consensus / TOB protocol.
+A \module{Consensus/TOB} module is oblivious of the epoch it is part of or the other \module{Consensus/TOB} instances.
+It only receives a list of heights as part of its configuration,
+for each of which it needs to deliver an agreed-upon value to the \module{Orchestrator} by emitting a \event{Deliver} event.
+
+If the \module{Consensus/TOB} module is configured with a proposal, it will use that proposal as input for the consensus protocol.
+Otherwise, it will request an availability certificate from a \module{Certificate Creator} module it is configured to use.
+
+The \module{Consensus/TOB} module consumes the following events:
+\begin{itemize}
+
+    \item \event{NewCert(cert)}\\
+    In case the \module{Consensus/TOB} module has not been pre-configured with a proposal for some height
+    and requested a new certificate from the \module{Certificate Creator},
+    the \event{NewCert} event carries a new availability certificate
+    that the \module{Consensus/TOB} module uses as a consensus proposal.
+
+    \item TODO: ProposalValidated?
+
+    \item The other events consumed by the \module{Consensus/TOB} module are specific to its implementation.
+    In our case, those are events for receiving various protocol message
+    (\event{Preprepare}, \event{Prepare}, \event{Commit}, \event{ViewChange}, etc.) and various PBFT-specific timeouts.
+
+\end{itemize}
+
+\subsubsection{\module{Proposal Validator}}
+\subsubsection{\module{Mempool}}
+\subsubsection{\module{Dissemination}}
+\subsubsection{\module{Block Store}}
+\subsubsection{\module{Application}}
+\subsubsection{\module{Block Fetcher}}
+\subsubsection{\module{Checkpointing}}
+\subsubsection{\module{Checkpoint Validator}}
+\subsubsection{\module{Networking}}
+\subsubsection{\module{Timer}}
+\subsubsection{\module{Hashing}}
+\subsubsection{\module{Crypto}}
+
+\subsection{TODO}
+
+\begin{itemize}
+    \item Dynamic module creation, message buffering
+    \item Multi-threaded sub-module execution
 \end{itemize}
 
 \section{Performance Evaluation}
@@ -860,8 +1001,7 @@ most of the batches in our experiments are not completely full and are triggered
     \centering
     \includegraphics[width=0.79\textwidth]{figures/results-lan-final.png}
     \caption{\centering Median latency (in seconds) vs. throughput (in tx/s)
-    in a LAN deployment of 32 and 64 replicas,
-    for various segment lengths and \param{BatchTimeout} values.}
+    in a LAN deployment of 32 and 64 replicas}
     \label{fig:eval-lan}
 \end{figure}
 
