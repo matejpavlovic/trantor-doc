@@ -829,11 +829,16 @@ The \module{Ordering} module consumes the following events:
 The \module{Consensus/TOB} modules are dynamically created and deleted by the \module{Ordering} module
 and are responsible for executing the consensus / TOB protocol.
 A \module{Consensus/TOB} module is oblivious of the epoch it is part of or the other \module{Consensus/TOB} instances.
-It only receives a list of heights as part of its configuration,
-for each of which it needs to deliver an agreed-upon value to the \module{Orchestrator} by emitting a \event{Deliver} event.
+It simply receives a list of heights as part of its configuration,
+and for each of these heights, it needs to agree on a value and announce it to the \module{Orchestrator} by emitting a \event{Deliver} event.
 
 If the \module{Consensus/TOB} module is configured with a proposal, it will use that proposal as input for the consensus protocol.
-Otherwise, it will request an availability certificate from a \module{Certificate Creator} module it is configured to use.
+Otherwise, it will request an availability certificate from a \module{Certificate Creator} module it is configured to use
+and proposes that certificate.
+
+It is sometimes useful for the implementation of the consensus protocol to be able to validate a received proposal early
+(e.g., as soon as it is received from another replica), so that the consensus protocol can be aborted early for invalid proposals.
+The \module{Consensus/TOB} implementation
 
 The \module{Consensus/TOB} module consumes the following events:
 \begin{itemize}
