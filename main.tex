@@ -351,6 +351,21 @@ A checkpoint thus contains the configuration for not just the epoch it starts,
 but also for \param{configOffset} additional subsequent epochs.
 Correspondingly, Trantor uses the initial configuration for the first $\param{configOffset}+1$ epochs.
 
+\subsection{Access Control and Input Validation}
+\label{sec:access-control-input-validation}
+
+Trantor does not authenticate the sources of received transactions and implements no access control.
+We believe this is not the task of the core of an SMR system and should be implemented on top of it.
+
+However, it is sometimes useful for the implementation of the consensus protocol to be able to validate a received proposal early
+(e.g., as soon as it is received from another replica), so that the consensus protocol can be aborted early for invalid proposals.
+Apart from opening the door to potentially important performance optimizations,
+such a mechanism might also be required for preventing certain forms of denial-of-service attacks.
+
+Trantor provides the necessary tools for the application to support such early proposal validation.
+The ordering component supports the integration of an optional external \module{ProposalValidator} module,
+allowing an early abortion of the ordering of transactions that this module (as injected dependency) considers invalid.
+
 \section{Algorithm Details}
 \label{sec:algorithm-details}
 
@@ -358,6 +373,7 @@ This section describes the algorithms we use to implement Trantor’s components
 and explains some additional noteworthy aspects of Trantor’s design.
 
 \subsection{Dissemination}
+\label{sec:dissemination}
 
 In each epoch, a subset of Trantor’s replicas are designated as leaders by the ordering component
 (see MirBFT \cite{mirbft} and ISS \cite{iss} for details).
@@ -690,7 +706,7 @@ This way, modules that otherwise do not have a reason to be aware of the progres
 -- which are, in fact, most of the modules --
 can be cleaner, simpler, more general, and thus more reusable.
 
-\begin{figure}[h]
+\begin{figure}[ht]
     \centering
     \includegraphics[width=\textwidth]{figures/implementation-diagram}
     \caption{Schematic view of Trantor's implementation's components.
@@ -703,8 +719,11 @@ can be cleaner, simpler, more general, and thus more reusable.
 \subsection{Trantor's Modules}
 
 \Cref{fig:implementation-diagram} displays all relevant modules of Trantor's implementation and their interactions.
-It rather accurately represents the structure of our code, omitting only few technical details not relevant for understanding the workings of the implementation.
-To improve the presentation, the names of some events and modules also do not necessarily fully correspond to those used in the code.
+It rather accurately represents the structure of our code, omitting only few technical details not relevant for understanding the workings of the implementation
+(e.g., the mechanism for verification of certificates or computing unique identifiers of transactions and transaction batches).
+To improve the presentation, the names of some events and modules also do not necessarily fully correspond to those used in our code.%
+\footnote{We will be consolidating our implementation of Trantor to closely match the more intuitive terminology used in this document,
+rather than the other way round (using less intuitive terminology in this document just to match our implementation).}
 
 For simplicity, this description also does not distinguish between modules handling local events (received from other modules)
 and network messages (from other replicas), even though they are handled slightly differently in practice,
@@ -798,7 +817,28 @@ The \module{Orchestrator} consumes the following events:
 
 \end{itemize}
 
+\subsubsection{\module{Proposal Validator}}
+\label{sec:module-proposal-validator}
+
+If Trantor is configured to use external input validation (see \cref{sec:access-control-input-validation}),
+the \module{Consensus/TOB} module may request the \module{Proposal Validator} to validate consensus proposals received from other replicas.
+The \module{Proposal Validator}'s implementation can perform arbitrary (potentially application-specific) checks on the proposal
+and notifies the \module{Consensus/TOB} about their result.
+
+The \module{Proposal Validator} module consumes only one type of event:
+
+\begin{itemize}
+    
+    \item \event{ValidateProposal(proposal)}\\
+    The \module{Proposal Validator} checks the validity of the given proposal and emits a \event{ProposalValidated} event
+    back to the module that emitted the \event{ValidateProposal} event (the \module{Consensus/TOB} module in our case).
+    Note that nothing prevents the \module{Proposal Validator} from communicating with other modules
+    (in particular, with the \module{Application}), or even with other replicas before responding to the validation request.
+    
+\end{itemize}
+
 \subsubsection{\module{Ordering}}
+\label{sec:module-ordering}
 
 The \module{Ordering} module is responsible for managing \module{Consensus/TOB} submodules.
 In each epoch, it contains one or more submodules that agree on the assignment of availability certificates
@@ -824,7 +864,7 @@ The \module{Ordering} module consumes the following events:
 
 \end{itemize}
 
-\subsection{\module{Consensus/TOB}}
+\subsubsection{\module{Consensus/TOB}}
 
 The \module{Consensus/TOB} modules are dynamically created and deleted by the \module{Ordering} module
 and are responsible for executing the consensus / TOB protocol.
@@ -833,23 +873,23 @@ It simply receives a list of heights as part of its configuration,
 and for each of these heights, it needs to agree on a value and announce it to the \module{Orchestrator} by emitting a \event{Deliver} event.
 
 If the \module{Consensus/TOB} module is configured with a proposal, it will use that proposal as input for the consensus protocol.
-Otherwise, it will request an availability certificate from a \module{Certificate Creator} module it is configured to use
+Otherwise, it will request an availability certificate from a \module{Disseminator} module it is configured to use
 and proposes that certificate.
-
-It is sometimes useful for the implementation of the consensus protocol to be able to validate a received proposal early
-(e.g., as soon as it is received from another replica), so that the consensus protocol can be aborted early for invalid proposals.
-The \module{Consensus/TOB} implementation
 
 The \module{Consensus/TOB} module consumes the following events:
 \begin{itemize}
 
     \item \event{NewCert(cert)}\\
-    In case the \module{Consensus/TOB} module has not been pre-configured with a proposal for some height
-    and requested a new certificate from the \module{Certificate Creator},
+    In case the \module{Consensus/TOB} module has not been pre-configured with a proposal
+    and requested a new certificate from the \module{Disseminator},
     the \event{NewCert} event carries a new availability certificate
     that the \module{Consensus/TOB} module uses as a consensus proposal.
 
-    \item TODO: ProposalValidated?
+    \item \event{ProposalValidated(validationResult)}\\
+    This event is relevant only if the \module{Consensus/TOB} module's implementation relies on external proposal validation
+    and has emitted a \event{ValidateProposal} (see \cref{sec:module-proposal-validator}) event.
+    If so, the \event{ProposalValidated} event carries the result of the validation
+    and triggers whatever further processing of the consensus protocol that has been waiting for it.
 
     \item The other events consumed by the \module{Consensus/TOB} module are specific to its implementation.
     In our case, those are events for receiving various protocol message
@@ -857,13 +897,278 @@ The \module{Consensus/TOB} module consumes the following events:
 
 \end{itemize}
 
-\subsubsection{\module{Proposal Validator}}
-\subsubsection{\module{Mempool}}
 \subsubsection{\module{Dissemination}}
+\label{sec:module-dissemination}
+
+Similarly to the \module{Ordering} module managing instances of \module{Consensus/TOB},
+the \module{Dissemination} module manages instances of \module{Disseminator} submodules.
+The main difference is that Trantor only uses a single \module{Disseminator} per epoch.
+
+The \module{Dissemination} module consumes the following events:
+
+\begin{itemize}
+
+    \item \event{NewModule(moduleConfig, retentionIndex)}\\
+    Upon receiving this event, the \module{Dissemination} module instantiates a new \module{Disseminator} submodule.
+    The created submodule is associated with the given retention index and parametrized according to \event{moduleConfig}.
+
+    \item \event{GarbageCollect(retentionIndex)}\\
+    Upon reception of this event (from the \module{Orchestrator}),
+    the \module{Dissemination} module deletes all its submodules that have been created with a lower retention index than the given one.
+
+\end{itemize}
+
+\subsubsection{\module{Disseminator}}
+
+\module{Disseminator}s are dynamically created and deleted by the \module{Dissemination} module
+and are responsible for disseminating transaction payloads to other replicas (see \cref{sec:dissemination})
+and producing availability certificates.
+Whenever a \module{Disseminator} produces a new availability certificate, it emits a \event{NewCert} event.
+
+A \module{Disseminator} is oblivious of the epoch it is part of
+and simply executes the dissemination algorithm according to the parameters it has been given.
+
+The \module{Disseminator} consumes the following events:
+
+\begin{itemize}
+
+    \item \event{RequestCert}\\
+    This event requests a new availability certificate.
+    In response, the \module{Disseminator} triggers a \event{NewCert} event containing the produced certificate.
+    Note that this need not necessarily happen immediately.
+    The implementation of the \module{Disseminator} may only trigger the data dissemination upon reception of a \event{CertRequest}.
+    In our implementation, however, the \module{Disseminator} continuously disseminates transaction data
+    and buffers the resulting certificates that it can immediately use as a response to a \event{CertRequest}
+
+    \item \event{NewBatch(batch)}\\
+    Through this event, the \module{Mempool} announces a new transaction batch ready to be disseminated.
+    The \module{Mempool} emits the \event{NewBatch} event as a response
+    to a \event{RequestBatch} previously emitted by the \module{Disseminator}.
+
+    \item \event{BatchStored}\\
+    The \event{BatchStored} event notifies the \module{Disseminator} that a batch has been persisted in the \module{Block Store}.
+    This occurs when the \module{Disseminator} has previously asked (through a \event{StoreBatch} event)
+    the \module{Block Store} to store a batch during the dissemination process.
+    In our implementation, this is when the \module{Disseminator} signs the stored batch and sends a \event{Sig} message (see \cref{sec:dissemination}).
+
+    \item \event{RequestTransactions(cert)}\\
+    Upon reception of this event, the \module{Disseminator} looks up all the transactions (including their payloads) referenced by \event{cert}.
+    If the referenced transactions are not present locally (in the \module{Block Store}),
+    the \module{Disseminator} requests the missing transactions from replicas that have signed \event{cert}.
+    The \module{Disseminator} then and emits a \event{ProvideTransactions} event containing those transactions.
+    
+    \item \event{BatchLookupResult}\\
+    This event informs the \module{Disseminator} of the result of looking up a transaction batch in the \module{Block Store}.
+
+\end{itemize}
+
 \subsubsection{\module{Block Store}}
+
+The \module{Block Store} is a simple module that persistently%
+\footnote{Our Go implementation uses an in-memory stub for the \module{Block Store}.}
+stores transaction batches (including payloads).
+It has a simple key-value-store-like interface and consumes the following events:
+
+\begin{itemize}
+    \item \event{StoreBatch(batchID, batchData, retentionIndex)}
+    The \module{Block Store} persistently stores \event{batchData} under \event{batchID}.
+    The \event{batchID} is derived from a hash of \event{batchData}.
+    The stored batch is associated with the given \event{retentionIndex} for garbage collection purposes.
+    Once the batch is stored, the \module{Block Store} emits a \event{BatchStored} event.
+
+    \item \event{LookUpBatch(batchID)}
+    The \module{Block Store} looks up the given \event{batchID} in its local database and emits a \event{BatchLookupResult} event
+    containing either the corresponding batch data or a flag that the batch was not found.
+    
+    \item \event{GarbageCollect(retentionIndex)}
+    This event makes the \module{Block Store} module delete all batches associated with a retention index smaller than \event{retentionIndex}.
+    The \module{Block Store} receives this event from the \module{Orchestrator} each time a new checkpoint is created.
+    
+\end{itemize}
+
+\subsubsection{\module{Mempool}}
+\label{sec:module-mempool}
+
+While, as mentioned in \cref{sec:mempool}, the design of Trantor treats the mempool as an external dependency,
+our implementation includes a \module{Mempool} module that accepts \event{NewTransactions} events and stores the contained transactions in memory.
+Upon receiving a \event{RequestBatch} event, the \module{Mempool} responds with a \event{NewBatch} event containing the stored transactions.
+The \module{Mempool}'s operation is influenced by several parameters%
+\footnote{Other modules, not just the \module{Mempool}, also can be parametrized in various ways, but we omit the description of these parameters for simplicity.
+We make an exception for the \emph{Mempool} and do describe its parameters, since they are relevant for our performance evaluation presented in \cref{sec:evaluation}.}:
+
+\begin{itemize}
+    
+    \item \param{MaxTransactionsInBatch}: An emitted \event{NewBatch} event never contains more than \param{MaxTransactionsInBatch} transactions.
+    If the number of stored transactions exceeds this value, the next emitted batch will contain the \param{MaxTransactionsInBatch} least recently added transactions.
+    
+    \item \param{MaxPayloadInBatch}: Analogously to \param{MaxTransactionsInBatch},
+    \param{MaxPayloadInBatch} defines the maximal total cumulative payload size of all transactions in a batch.
+    
+    \item \param{BatchTimeout}: To enable effective batching of transactions, the mempool does not respond to a \event{BatchRequest} immediately
+    if there are not enough pending transactions for reaching at least one of the two above limits.
+    \param{BatchTimeout} defines the maximal time the mempool waits for a batch to fill.
+    After \param{BatchTimeout} elapses, the mempool emits a \event{NewBatch}, even if it is not full (or is even completely empty).
+\end{itemize}
+
+When the \module{Mempool} emits a transaction batch, the batch still needs to be proposed, ordered, and executed.
+If the transactions end up not being executed for some reason (e.g., the ordering fails due to network asynchrony),
+Trantor needs to propose a batch with those transactions again.
+Thus, transactions can be removed from the \module{Mempool} only after they have been executed
+and the corresponding state of Trantor has been captured in a checkpoint.
+
+At the same time, transactions that \emph{are going to be} executed (and checkpointed) should not be included in new batches emitted by the \module{Mempool}.
+However, the \module{Mempool} cannot know which of the already emitted transactions are going to make it into a checkpoint and which are not.
+A simple solution would be to simply delay emitting a new batch until the previous one has either succeeded or failed to be executed.
+This is very restrictive and may be detrimental to performance.
+Instead, we make the \module{Mempool} aware of Trantor epochs and allow it to emit each transaction only once per epoch.
+We leverage the fact that epoch transitions are a form of synchronization points with no ``in-flight'' batches.
+At the end of an epoch, all executed transactions are checkpointed and can be safely deleted from the \module{Mempool}.
+Transactions that have not been executed need to be proposed again in the next epoch.
+
+The \module{Mempool} also keeps track of client watermarks (see \cref{sec:tx-deduplication})
+and ignores all transactions that are outside of their respective clients' watermark windows.
+A client that has never submitted a transaction is defined to have a watermark window starting at \textit{TxNo} 0
+(no explicit ``registration'' of clients is necessary).
+Trantor updates the \module{Mempool}'s watermark information at the beginning of every epoch.
+
+The \module{Mempool} consumes the following events:
+
+\begin{itemize}
+
+    \item \event{NewTransactions(transactions)}\\
+    The \module{Mempool} stores all the provided \event{transactions} that are within their respective client's watermark windows.
+
+    \item \event{RequestBatch}
+    The \module{Mempool}, according to its parametrization, eventually emits a \event{NewBatch} event.
+
+    \item \event{BatchTimeout}
+    When waiting for a batch to fill, the \module{Mempool} sets up a timer
+    (by emitting a \event{TimerDelay} event to the \module{Timer} module)
+    to receive this event after \param{BatchTimeout}.
+    Upon reception of this event, the \module{Mempool} emits a \event{NewBatch} event with the corresponding batch, unless it has already done so.
+
+    \item \event{NewEpoch(executedTXs)}
+    The \module{Mempool} receives this event at the start of every epoch to
+    \begin{itemize}
+        \item update its view of the client watermark windows according to \event{executedTXs},
+        \item delete all \event{executedTXs}, and
+        \item reset the internal trackers of already emitted transactions.
+    \end{itemize}
+
+\end{itemize}
+
 \subsubsection{\module{Application}}
+
+The \module{Application} module simply wraps the user-defined application (see \cref{sec:execution}) in a module.
+On reception of an event, the \module{Application} module simply calls the corresponding function of the execution component
+and emits an event with that function's return value (if any).
+
+The \module{Application} module consumes the following events:
+
+\begin{itemize}
+
+    \item \event{OrderedBatch(batch)}
+    The \module{Application} module calls the \code{ApplyTXs(transactions)} function of the application.
+
+    \item \event{SnapshotRequest}
+    The \module{Application} module calls the \code{Snapshot()} function of the application
+    and emits a \event{Snapshot} event containing its return value.
+    This \event{Snapshot} event goes directly to the \module{Checkpoint} module responsible for creating the checkpoint the snapshot is part of.
+
+    \item \event{RestoreState(checkpoint)}
+    The \module{Application} module calls the \code{RestoreState(checkpoint)} function of the application.
+
+    \item \event{NewEpoch}
+    The \module{Application} module calls the \code{NewEpoch} function on the application
+    and emits a \event{NewConfig} event containing the returned configuration.
+
+    \item \event{Checkpoint}
+    The \module{Application} module calls the \code{Checkpoint(checkpoint)} function on the application.
+
+\end{itemize}
+
 \subsubsection{\module{Block Fetcher}}
+
+In general, it is mostly the \module{Orchestrator} that assembles a sequence of events to be consumed by the \module{Application}.
+This includes events for requesting state snapshots, restoring the state, and notifications about new checkpoints and epochs.
+It is only the \event{OrderedBatch} events that are missing in this sequence -- the \module{Orchestrator} emits \event{OrderedCert}s in their place.
+
+The \module{Block Fetcher}'s main task is to replace the \event{OrderedCert} events in this sequence by the corresponding \event{OrderedBatch} events
+and deliver the sequence to the \module{Application}.
+When constructing the \event{OrderedBatch} events, the \module{Block Fetcher} also removes duplicate transactions as described in \cref{sec:tx-deduplication}.
+
+Replacing an \event{OrderedCert} by an \event{OrderedBatch} involves communication with the corresponding \module{Disseminator}
+which, in turn, might even need to communicate with other replicas over the network.
+In the meantime, the \module{Block Fetcher} might receive more events from the \module{Orchestrator}.
+The \module{Block Fetcher} can buffer such events and delay their processing until it has finished fetching the batch.
+This is required if the content of the batch can change the \module{Block Fetcher}'s state (e.g., the information about delivered transactions)
+on which the processing of subsequent events depends.
+
+The \module{Block Fetcher} keeps track of the current epoch by observing the \event{NewEpoch} events emitted by the \module{Orchestrator}.
+It uses the epoch information to always request the transaction batches from the correct \module{Disseminator} instance.
+
+The \module{Block Fetcher} consumes the following events:
+
+\begin{itemize}
+
+    \item \event{OrderedCert(cert)}\\
+    The \module{Block Fetcher} requests the transaction batch from the current epoch's \module{Disseminator} instance
+    by emitting a \event{RequestTransactions} event.
+
+    \item \event{ProvideTransactions(transactions)}\\
+    This event is the \module{Disseminator}'s response to the previously emitted \event{RequestTransactions} event.
+    Upon receiving it, the \module{Block Fetcher} assembles a new batch from only those \event{transactions}
+    that have not yet been delivered to the \module{Application} and creates a new \event{OrderedBatch} event.
+    The \module{Block Fetcher} then either directly emits the new \event{OrderedBatch} event
+    or, in case a previous event is still waiting to be emitted, enqueues it for later in-order emission.
+
+    \item \event{SnapshotRequest}
+    This event is emitted by the \module{Orchestrator} during the creation of a checkpoint.
+    The \module{Block Fetcher} relays this event to the \module{Application}.
+    Moreover, since the \module{Block Fetcher} also contains state than must be checkpointed (the client watermark information),
+    it serializes the relevant part of its state and emits a \event{ClientProgress} event directly to the corresponding \module{Checkpoint} module.
+
+    \item \event{RestoreState(checkpoint)}
+    The \module{Block Fetcher} relays this event to the \module{Application} and re-initializes the relevant parts of its own state
+    (epoch number and client watermark information).
+
+    \item \event{NewEpoch}
+    The \module{Block Fetcher} updates its local view of the epoch number and relays the event to the \module{Application}.
+    It also emits a \event{NewEpoch} event to the \module{Mempool} with information about the transactions executed so far (see \cref{sec:module-mempool}).
+    
+    \item \event{Checkpoint}
+    The \module{Block Fetcher} relays this event to the \module{Application}.
+
+\end{itemize}
+
 \subsubsection{\module{Checkpointing}}
+
+Analogously to the \module{Dissemination} module (\cref{sec:module-dissemination}),
+the \module{Checkpointing} module manages instances of the \module{Checkpoint} submodule,
+each of which is responsible for creating a single checkpoint.
+At the start of each epoch, the \module{Orchestrator} creates a new \module{Checkpoint} instance that assembles the starting checkpoint of that epoch.
+
+The \module{Checkpointing} module consumes the following events:
+
+\begin{itemize}
+
+    \item \event{NewModule(moduleConfig, retentionIndex)}\\
+    Upon receiving this event, the \module{Checkpointing} module instantiates a new \module{Checkpoint} submodule.
+    The created submodule is associated with the given retention index and parametrized according to \event{moduleConfig}.
+
+    \item \event{GarbageCollect(retentionIndex)}\\
+    Upon reception of this event,
+    the \module{Checkpointing} module deletes all its submodules that have been created with a lower retention index than the given one.
+
+\end{itemize}
+
+\subsubsection{Checkpoint}
+
+The \module{Checkpoint} module represents a single instance of the checkpointing subprotocol described in \cref{sec:creating-checkpoints}.
+Trantor creates one such instance at the start of each epoch.
+Every instance creates a checkpoint corresponding to the state of the system after finishing the previous epoch
+and before delivering any transactions in the next current one.
+
 \subsubsection{\module{Checkpoint Validator}}
 \subsubsection{\module{Networking}}
 \subsubsection{\module{Timer}}
@@ -911,29 +1216,6 @@ The replicas are either all connected by a local network (LAN) or dispersed over
 For the WAN deployments, replicas are uniformly distributed among the 8 different locations,
 i.e., 4 replicas and 8 replicas in each location respectively for deployments of 32 and 64 replicas.
 
-\subsection{Mempool Implementation}
-
-While, as mentioned in \cref{sec:mempool}, the design of Trantor treats the mempool as an external dependency,
-our implementation includes a mempool module that accepts \event{NewTransaction} events and stores the contained transactions in memory.
-Upon receiving a \event{RequestBatch} event, the mempool responds with a \event{NewBatch} event containing the stored transactions.
-The mempool's operation is influenced by several parameters:
-
-\begin{itemize}
-    
-    \item \param{MaxTransactionsInBatch}: An emitted \event{NewBatch} event never contains more than \param{MaxTransactionsInBatch} transactions.
-    If the number of stored transactions exceeds this value, the next emitted batch will contain the \param{MaxTransactionsInBatch} least recently added transactions.
-    In our experiments, we always use a value 2048 for this parameter (chosen empirically after exploring a few others).
-    
-    \item \param{MaxPayloadInBatch}: Analogously to \param{MaxTransactionsInBatch},
-    \param{MaxPayloadInBatch} defines the maximal total cumulative payload size of all transactions in a batch.
-    We use a very large value of 16MB in our experiments to effectively disable this limit.
-    
-    \item \param{BatchTimeout}: To enable effective batching of transactions, the mempool does not respond to a \event{BatchRequest} immediately
-    if there are not enough pending transactions for reaching at least one of the two above limits.
-    \param{BatchTimeout} defines the maximal time the mempool waits for a batch to fill.
-    After \param{BatchTimeout} elapses, the mempool emits a \event{NewBatch}, even if it is not full (or is even completely empty).
-\end{itemize}
-
 \subsection{Load Generation Generation and Data Collection}
 
 To generate the load, we implement simple clients that generate transactions and insert them into the replicas' mempools.
@@ -948,6 +1230,8 @@ We consider a client's transaction \textit{tx} delivered when the replica the cl
 In our experiments, we gradually increase the number of such clients until the system becomes saturated and the throughput stops increasing.
 Most of the time, it takes tens of thousands of clients to saturate the system.
 
+Our mempool implementation is parametrized with \param{MaxTransactionsInBatch} = 2048 (chosen empirically after exploring a few others),
+\param{MaxPayloadInBatch} = 16MB (a very large value that effectively disables this limit), and a varying \param{BatchTimeout}.
 The duration of each run (corresponding to one data point in the plots) is 2 minutes.
 
 \subsection{Latency Metrics}
@@ -1064,13 +1348,15 @@ In our experiments, such duplication does not occur, since we also do not expect
 Nevertheless, a slightly modified version of Trnator's dissemination and ordering components
 can easily implement a deduplication mechanism \cite{mirbft,iss} to mitigate this issue.
 
-\paragraph{Access Control.}
-Trantor does not authenticate the sources of received transactions and implements no access control.
-We believe this is not the task of the core of an SMR system and should be implemented on top of it.
-Trantor provides all the necessary tools for the application to support access control, however.
-The ordering component supports an optional external input validation mechanism (not discussed so far for simplicity),
-allowing an early abortion of the ordering of transactions that an injected dependency considers invalid.
-Our evaluation does not make use of it and thus also does not take into account it's potential overhead.
+\paragraph{Persistent Storage.}
+Our implementation of the \module{Block Store} is a stub that does not persistently store any data.
+Instead, we use a simple in-memory hash map to store the batches.
+The overhead of accessing stable storage is thus not taken into account in our performance evaluation.
+
+\paragraph{Access Control and Input Validation.}
+As discussed in \cref{sec:access-control-input-validation}, Trantor does not, by default, perform access control or input validation
+(although it can be configured to do so).
+Thus, our evaluation does not take into account it's potential overhead.
 
 \paragraph{Unoptimized Implementation.}
 Trantor's current implementation focuses on modularity and feature-completeness rather than on immediate performance optimization.
