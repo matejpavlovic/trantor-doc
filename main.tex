@@ -1167,13 +1167,83 @@ The \module{Checkpointing} module consumes the following events:
 The \module{Checkpoint} module represents a single instance of the checkpointing subprotocol described in \cref{sec:creating-checkpoints}.
 Trantor creates one such instance at the start of each epoch.
 Every instance creates a checkpoint corresponding to the state of the system after finishing the previous epoch
-and before delivering any transactions in the next current one.
+and before delivering any transactions in the current one.
+
+Before starting the checkpointing protocol, the \module{Checkpoint} module waits for receiving the state to be checkpointed.
+Part of this state (relevant state of Trantor itself and future membership configurations)
+is provided directly by the \module{Orchestrator} at initialization.
+The rest -- the serialized application state and the most up-to-date client watermark information --
+arrives later in, respectively a \event{Snapshot} event and a \event{ClientProgress} event.
+After having received both, the protocol starts, eventually outputting a certified checkpoint.
+
+Different replicas might be ready to start executing the checkpointing protocol at different times.
+Replicas receiving protocol messages before having themselves started the protocol buffer (a limited amount of) the early messages
+and process them right after starting the protocol execution.
+
+The \module{Checkpoint} module consumes the following events:
+
+\begin{itemize}
+    \item \event{Snapshot(appSnapshot)}\\
+    Delivers the snapshot of the application state to be checkpointed.
+    If the \event{ClientProgress} has already been received, the module starts the checkpointing protocol.
+    
+    \item \event{ClientProgress(clWatermarkData)}\\
+    Delivers the most up-to-date client watermark infromation.
+    If the \event{Snapshot} has already been received, the module starts the checkpointing protocol.
+
+    \item The other events consumed by the \module{Checkpoint} module are specific to its implementation.
+    In our case, those are events for receiving protocol messages.
+\end{itemize}
 
 \subsubsection{\module{Checkpoint Validator}}
-\subsubsection{\module{Networking}}
-\subsubsection{\module{Timer}}
-\subsubsection{\module{Hashing}}
-\subsubsection{\module{Crypto}}
+
+The \module{Checkpoint Validator} validates checkpoints received over the network.
+In particular, the \module{Orchestrator} requests a checkpoint validation each time when "catching up",
+i.e., when it receives a checkpiont over the network.
+
+We expect that the \module{Checkpoint} module and the \module{Checkpoint Validator} modules are developed in a coordinated way,
+such that checkpoints produced by the former can be validated by the latter.
+
+The \module{Checkpoint Validator} module consumes the following event:
+
+\begin{itemize}
+
+    \item \event{ValidateCheckpoint(checkpoint)}\\
+    Validates the given checkpoints and emits a \event{CheckpointValidated} event with the validation result.
+    
+\end{itemize}
+
+\subsubsection{\module{Networking}, \module{Timer}, \module{Hashing}, \module{Crypto}}
+
+These modules provide low-level functionality supporting many of the modules described above.
+The interaction with these modules has been omitted as a technical detail.
+For an intuition about their workings, however, we list the events they consume:
+\begin{itemize}
+    
+    \item \module{Networking}
+    \begin{itemize}
+        \item \event{SendMessage(message, destinations)}
+    \end{itemize}
+    
+    \item \module{Timer}
+    \begin{itemize}
+        \item \event{DelayEvent(event, delay)}
+        \item \event{RepeatEvent(event, period, retentionIndex)}
+        \item \event{GarbageCollect(retentionIndex)}
+    \end{itemize}
+
+    \item \module{Hashing}
+    \begin{itemize}
+        \item \event{Hash(data)}
+    \end{itemize}
+
+    \item \module{Crypto}
+    \begin{itemize}
+        \item \event{Sign(data)}
+        \item \event{VerifySig(data, signer)}
+    \end{itemize}
+    
+\end{itemize}
 
 \subsection{TODO}
 
